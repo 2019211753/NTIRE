@@ -1,0 +1,68 @@
+ # Copyright (c) 2022, salesforce.com, inc.
+ # All rights reserved.
+ # SPDX-License-Identifier: BSD-3-Clause
+ # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
+
+model:
+  arch: fga_blip2
+  model_type: coco
+  load_pretrained: True
+  load_finetuned: True 
+  freeze_vit: True
+datasets:
+  alignment: # name of the dataset builder
+    vis_processor:
+        train:
+          name: "blip2_image_train"
+          image_size: 364
+        eval:
+          name: "blip_image_eval"
+          image_size: 364
+    text_processor:
+        train:
+          name: "blip_caption"
+        eval:
+          name: "blip_caption"
+    build_info:
+        annotations:
+          train:
+            url: "dataset/train_mask.json"
+            storage: dataset/train_mask.json
+        images:
+            storage: "dataset/images"
+
+run:
+  task: alignment
+  # optimizer
+  lr_sched: "linear_warmup_cosine_lr"
+  init_lr: 1e-5
+  min_lr: 1e-6
+  warmup_lr: 1e-8
+  warmup_steps: 100
+  weight_decay: 0.05
+  max_epoch: 4
+  batch_size_train: 14
+  batch_size_eval: 16
+  lr_layer_decay: 0.95 # layer-wise learning rate decay for the ViT 
+  num_workers: 4
+  accum_grad_iters: 1
+
+  seed: 42
+  output_dir: "output/FGA-BLIP2"
+
+  amp: True
+  resume_ckpt_path: null
+
+  evaluate: False
+  train_splits: ["train"]
+  valid_splits: ["test"]
+  # test_splits: ["test"]
+  k_test: 128
+  save_freq: 1
+
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: True
+  use_dist_eval_sampler: False
+

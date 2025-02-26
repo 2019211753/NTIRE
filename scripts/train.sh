@@ -1,0 +1,1 @@
+python3 -m torch.distributed.run --nnodes=1 --nproc_per_node=1 --master_port=10000  train.py --cfg-path lavis/projects/blip2/train/fga_blip2.yaml
