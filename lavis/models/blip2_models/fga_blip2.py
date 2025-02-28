@@ -193,7 +193,7 @@ class FGA_Blip2(Blip2Qformer):
         ).squeeze() # [14, 14, 32]
 
         # text-image similarity: aggregate across all query tokens
-        sim_t2i, _ = sim_t2q.max(-1) [14, 14]
+        sim_t2i, _ = sim_t2q.max(-1) # [14, 14]
         sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
 
         with torch.no_grad():
