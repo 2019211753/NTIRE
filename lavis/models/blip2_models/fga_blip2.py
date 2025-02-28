@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from lavis.common.registry import registry
 from lavis.models.blip2_models.blip2_qformer import Blip2Qformer
 from lavis.models.blip_models.blip_outputs import BlipOutput
+import torch.distributed as dist
 
 class MLP(nn.Module):
     def __init__(self, input_size):
@@ -141,7 +142,7 @@ class FGA_Blip2(Blip2Qformer):
             image_embeds = image_embeds.float()
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
             image.device
-        )
+        ) # image和query的交叉注意力是全1的mask
         # breakpoint()
         text = self.tokenizer(
             caption,
@@ -149,47 +150,131 @@ class FGA_Blip2(Blip2Qformer):
             truncation=True,
             max_length=self.max_txt_len,
             return_tensors="pt",
-        ).to(image.device)
+        ).to(image.device) # [14, 32]
+
+        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1) # [1, 32, 768] -> [14, 32, 768]
+        # query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to( # [14, 32]
+        #     image.device
+        # )
+        # attention_mask = torch.cat([query_atts, text.attention_mask], dim=1) # [14, 64] attention_mask标志padding部分
+        query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=image_atts,
+            use_cache=True,
+            return_dict=True,
+        )
+        image_feats = F.normalize(
+            self.vision_proj(query_output.last_hidden_state), dim=-1
+        )
+
+        text_output = self.Qformer.bert(
+            text.input_ids,
+            attention_mask=text.attention_mask,
+            return_dict=True,
+        )  # last_hidden_state [14, 32, 768]
+        text_feat = F.normalize(
+            self.text_proj(text_output.last_hidden_state[:, 0, :]), dim=-1
+        ) # [cls], [14, 256]
+        # [batch_size, batch_size*num_gpu, num_query_tokens]
+        sim_q2t = torch.matmul(
+            image_feats.unsqueeze(1), text_feat.unsqueeze(-1)
+        ).squeeze() # [14, 14, 32]
+
+        sim_i2t, _ = sim_q2t.max(-1) # [14, 14]
+        sim_i2t = sim_i2t / self.temp
+
+        rank = dist.get_rank()
+        bs = image.size(0)
+
+        # text-query similarity: [batch_size, batch_size, num_query_tokens]
+        sim_t2q = torch.matmul(
+            text_feat.unsqueeze(1).unsqueeze(1), image_feats.permute(0, 2, 1)
+        ).squeeze() # [14, 14, 32]
+
+        # text-image similarity: aggregate across all query tokens
+        sim_t2i, _ = sim_t2q.max(-1) [14, 14]
+        sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
+
+        with torch.no_grad():
+            weights_t2i = F.softmax(sim_t2i, dim=1) + 1e-4
+            weights_t2i[:, rank * bs: rank * bs + bs].fill_diagonal_(0)
+            weights_i2t = F.softmax(sim_i2t, dim=1) + 1e-4
+            weights_i2t[:, rank * bs: rank * bs + bs].fill_diagonal_(0) # [14, 14[
+
+        # select a negative image for each text
+        image_embeds_neg = []
+        for b in range(bs):
+            neg_idx = torch.multinomial(weights_t2i[b], 1).item()
+            image_embeds_neg.append(image_embeds[neg_idx])
+        image_embeds_neg = torch.stack(image_embeds_neg, dim=0)
+
+        # select a negative text for each image
+        text_ids_neg = []
+        text_atts_neg = []
+        for b in range(bs):
+            neg_idx = torch.multinomial(weights_i2t[b], 1).item()
+            text_ids_neg.append(text.input_ids[neg_idx])
+            text_atts_neg.append(text.attention_mask[neg_idx])
+
+        text_ids_neg = torch.stack(text_ids_neg, dim=0)
+        text_atts_neg = torch.stack(text_atts_neg, dim=0)
+
+        text_ids_all = torch.cat(
+            [text.input_ids, text.input_ids, text_ids_neg], dim=0
+        )  # pos, pos, neg
+        text_atts_all = torch.cat(
+            [text.attention_mask, text.attention_mask, text_atts_neg],
+            dim=0,
+        )
+
+        query_tokens_itm = self.query_tokens.expand(text_ids_all.shape[0], -1, -1)
+        query_atts_itm = torch.ones(query_tokens_itm.size()[:-1], dtype=torch.long).to(
+            image.device
+        )
+        attention_mask_all = torch.cat([query_atts_itm, text_atts_all], dim=1)
+
+        image_embeds_all = torch.cat(
+            [image_embeds, image_embeds_neg, image_embeds], dim=0
+        )  # pos, neg, pos
+        image_atts_all = torch.ones(image_embeds_all.size()[:-1], dtype=torch.long).to(
+            image.device
+        )
 
         if match_head == "itm":
-            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1) # [1, 32, 768] -> [14, 32, 768]
-            query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to( # [14, 32]
-                image.device
-            )
-            attention_mask = torch.cat([query_atts, text.attention_mask], dim=1) # [14, 64] attention_mask标志padding部分
             output_itm = self.Qformer.bert(
-                text.input_ids,
-                query_embeds=query_tokens,
-                attention_mask=attention_mask,
-                encoder_hidden_states=image_embeds,
-                encoder_attention_mask=image_atts,
+                text_ids_all,
+                query_embeds=query_tokens_itm,
+                attention_mask=attention_mask_all,
+                encoder_hidden_states=image_embeds_all,
+                encoder_attention_mask=image_atts_all,
                 return_dict=True,
             )
+
             itm_embeddings = output_itm.last_hidden_state[:, :, :] # [14, 64, 768]
             itm_logit = self.itm_head(itm_embeddings) # [14, 64, 2]
-            itm_scores = torch.nn.functional.softmax(itm_logit, dim=2)[:,:,1] # [14, 64]
-
+            cs_logits = itm_logit.mean(dim=1)
+            itm_labels = torch.cat(
+                [torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
+                dim=0,
+            ).to(image.device)
+            loss_cs = F.cross_entropy(cs_logits, itm_labels)
 
             # mask = self.mask_proj(itm_embeddings).squeeze(dim=2)
             # mask = torch.sigmoid(mask)
             # mask = mask * text.attention_mask
-
-
             # mask = torch.sigmoid(mask)
             # mask = mask * text.attention_mask
+
             # ############## stage 1 #################
-            text_output = self.Qformer.bert(
-                text.input_ids,
-                attention_mask=text.attention_mask,
-                return_dict=True,
-            ) # last_hidden_state [14, 32, 768]
+            itm_scores = torch.nn.functional.softmax(itm_logit, dim=2)[:,:,1] # [14, 64], in [0, 1]
+            itm_score = itm_scores[:bs, :].mean(dim=1) * 4 + 1 # item_scores[0:32], project to [0, 5] score
             mask = self.mask_proj(text_output.last_hidden_state).squeeze(dim=2)
-            itm_score = itm_scores[:, :query_tokens.size(1)].mean(dim=1) * 4 + 1 # item_scores[0:32], project to [0, 5] score
             # itm_score = (itm_scores * mask).sum(dim=1) / mask.sum(dim=1) * 4 + 1
             # itm_logit = (itm_logit * mask).sum(dim=1) / mask.sum(dim=1)
             # breakpoint()
             # itm_scores = torch.nn.functional.softmax(itm_logit, dim=1) * 4 + 1
-            
+
             # breakpoint()
             # itm_scores = self.mlp(itm_embeddings).mean(dim=1) * 4 + 1
             if inference:
@@ -202,9 +287,9 @@ class FGA_Blip2(Blip2Qformer):
                 return itm_score
             l1_loss = torch.nn.L1Loss(reduction='mean')
             diff_score = torch.abs(itm_score - score)
-            diff_token_score = torch.abs(itm_scores[:, query_tokens.size(1):] * mask_gt - token_score).mean(dim=1) # token level itm_scores[:32]
+            diff_token_score = torch.abs(itm_scores[:bs, query_tokens.size(1):] * mask_gt - token_score).mean(dim=1) # token level itm_scores[:32]
             diff_mask = torch.abs(mask - mask_gt).mean(dim=1)
-            loss_itm = torch.mean(var * (diff_score + 0.1 * diff_token_score + 0.1 * diff_mask))
+            loss_itm = torch.mean(var * (diff_score + 0.1 * diff_token_score + 0.1 * diff_mask + loss_cs))
             # loss_itm = (itm_scores[:, 1] - score) * (itm_scores[:, 1] - score)
             # breakpoint()
             # loss_itm = loss_itm.mean()
@@ -282,3 +367,4 @@ class FGA_Blip2(Blip2Qformer):
             # print(loss_itc.shape)
             loss_itc = loss_itc.mean()
             return BlipOutput(loss=loss_itc, loss_itc=loss_itc)
+        return None

@@ -511,7 +511,7 @@ class Blip2Qformer(Blip2Base):
         vit_precision = cfg.get("vit_precision", "fp16")
         freeze_vit = cfg.get("freeze_vit", True)
 
-        max_txt_len = cfg.get("max_txt_len", 32)
+        max_txt_len = cfg.get("max_txt_len", 32) # query和text的token长度都是32
 
         model = cls(
             vit_model=vit_model,
