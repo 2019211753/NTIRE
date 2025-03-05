@@ -84,6 +84,7 @@ class FGA_Blip2(Blip2Qformer):
         # self.mask_proj = torch.nn.Linear(self.Qformer.config.hidden_size, 1)
         # self.weight_proj = MLP(self.Qformer.config.hidden_size)
         self.mask_proj = MLP(self.Qformer.config.hidden_size)
+        self.cs_head = nn.Linear(self.Qformer.config.hidden_size, 2)
         # for name, parms in self.named_parameters():
         #     if '_proj' not in name:
         #         parms.requires_grad_(False)
@@ -176,6 +177,7 @@ class FGA_Blip2(Blip2Qformer):
         text_feat = F.normalize(
             self.text_proj(text_output.last_hidden_state[:, 0, :]), dim=-1
         ) # [cls], [14, 256]
+
         # [batch_size, batch_size*num_gpu, num_query_tokens]
         sim_q2t = torch.matmul(
             image_feats.unsqueeze(1), text_feat.unsqueeze(-1)
@@ -200,7 +202,7 @@ class FGA_Blip2(Blip2Qformer):
             weights_t2i = F.softmax(sim_t2i, dim=1) + 1e-4
             weights_t2i[:, rank * bs: rank * bs + bs].fill_diagonal_(0)
             weights_i2t = F.softmax(sim_i2t, dim=1) + 1e-4
-            weights_i2t[:, rank * bs: rank * bs + bs].fill_diagonal_(0) # [14, 14[
+            weights_i2t[:, rank * bs: rank * bs + bs].fill_diagonal_(0) # [14, 14]
 
         # select a negative image for each text
         image_embeds_neg = []
@@ -250,15 +252,13 @@ class FGA_Blip2(Blip2Qformer):
                 encoder_attention_mask=image_atts_all,
                 return_dict=True,
             )
-
-            itm_embeddings = output_itm.last_hidden_state[:, :, :] # [14, 64, 768]
-            itm_logit = self.itm_head(itm_embeddings) # [14, 64, 2]
-            cs_logits = itm_logit.mean(dim=1)
-            itm_labels = torch.cat(
+            cs_embeddings = output_itm.last_hidden_state[:, :query_tokens_itm.size(1), :] # [14, 64, 768]
+            cs_logits = self.cs_head(cs_embeddings).mean(dim=1)
+            cs_labels = torch.cat(
                 [torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
                 dim=0,
             ).to(image.device)
-            loss_cs = F.cross_entropy(cs_logits, itm_labels)
+            loss_cs = F.cross_entropy(cs_logits, cs_labels)
 
             # mask = self.mask_proj(itm_embeddings).squeeze(dim=2)
             # mask = torch.sigmoid(mask)
@@ -267,8 +267,10 @@ class FGA_Blip2(Blip2Qformer):
             # mask = mask * text.attention_mask
 
             # ############## stage 1 #################
+            itm_embeddings = output_itm.last_hidden_state[:, :, :] # [14, 64, 768]
+            itm_logit = self.itm_head(itm_embeddings) # [14, 64, 2]
             itm_scores = torch.nn.functional.softmax(itm_logit, dim=2)[:,:,1] # [14, 64], in [0, 1]
-            itm_score = itm_scores[:bs, :].mean(dim=1) * 4 + 1 # item_scores[0:32], project to [0, 5] score
+            itm_score = itm_scores[:bs, :query_tokens_itm.size(1)].mean(dim=1) * 4 + 1 # item_scores[0:32], project to [0, 5] score
             mask = self.mask_proj(text_output.last_hidden_state).squeeze(dim=2)
             # itm_score = (itm_scores * mask).sum(dim=1) / mask.sum(dim=1) * 4 + 1
             # itm_logit = (itm_logit * mask).sum(dim=1) / mask.sum(dim=1)
@@ -289,7 +291,7 @@ class FGA_Blip2(Blip2Qformer):
             diff_score = torch.abs(itm_score - score)
             diff_token_score = torch.abs(itm_scores[:bs, query_tokens.size(1):] * mask_gt - token_score).mean(dim=1) # token level itm_scores[:32]
             diff_mask = torch.abs(mask - mask_gt).mean(dim=1)
-            loss_itm = torch.mean(var * (diff_score + 0.1 * diff_token_score + 0.1 * diff_mask + loss_cs))
+            loss_itm = torch.mean(var * (diff_score + 0.1 * diff_token_score + 0.1 * diff_mask) + 0.2 * loss_cs)
             # loss_itm = (itm_scores[:, 1] - score) * (itm_scores[:, 1] - score)
             # breakpoint()
             # loss_itm = loss_itm.mean()

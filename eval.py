@@ -99,7 +99,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_file', type=str, default='dataset/test.json')
     parser.add_argument('--save_path', type=str, default='results/result.json')
-    parser.add_argument('--model_path', type=str, default='/data1_8t/user/yb/EvalMuse/lavis/output/FGA-BLIP2/20250215171/checkpoint_3.pth')
+    parser.add_argument('--model_path', type=str, default='/data1_8t/user/yb/EvalMuse/lavis/output/FGA-BLIP2/20250304205/checkpoint_7.pth')
     parser.add_argument('--dataset_dir', type=str, default='dataset/images/')
     args = parser.parse_args()
     eval(args)
