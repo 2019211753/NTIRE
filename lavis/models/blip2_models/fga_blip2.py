@@ -11,7 +11,12 @@ import torch.nn.functional as F
 from lavis.common.registry import registry
 from lavis.models.blip2_models.blip2_qformer import Blip2Qformer
 from lavis.models.blip_models.blip_outputs import BlipOutput
-
+from groundingdino.models.GroundingDINO.groundingdino import build_groundingdino
+from groundingdino.util.slconfig import SLConfig
+from groundingdino.util.utils import clean_state_dict
+model_config_path = '/data1_8t/user/md/zwd_fjk_visual/NTIRE/groundingdino/config/GroundingDINO_SwinT_OGC.py'
+import time
+model_checkpoint_path = '/data1_8t/user/md/zwd_fjk_visual/GroundingDINO/weights/groundingdino_swint_ogc.pth'
 class MLP(nn.Module):
     def __init__(self, input_size):
         super().__init__()
@@ -41,6 +46,31 @@ class MLP(nn.Module):
         
     def forward(self, input):
         return torch.sigmoid(self.layers(input))
+    
+class MLP_dino(nn.Module):
+    def __init__(self, input_size=256, output_size=1408):
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+
+        self.layers = nn.Sequential(
+            nn.Linear(self.input_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, self.output_size),  # 变为 1408
+        )
+
+        # 初始化 MLP 参数
+        for name, param in self.layers.named_parameters():
+            if 'weight' in name:
+                nn.init.normal_(param, mean=0.0, std=1.0/(self.input_size+1))
+            if 'bias' in name:
+                nn.init.constant_(param, val=0)
+
+    def forward(self, input):
+        return self.layers(input)  # 不使用 Sigmoid
+
 
 @registry.register_model("fga_blip2")
 class FGA_Blip2(Blip2Qformer):
@@ -83,10 +113,17 @@ class FGA_Blip2(Blip2Qformer):
         # self.mask_proj = torch.nn.Linear(self.Qformer.config.hidden_size, 1)
         # self.weight_proj = MLP(self.Qformer.config.hidden_size)
         self.mask_proj = MLP(self.Qformer.config.hidden_size)
+        self.dino_layer = MLP_dino()
         # for name, parms in self.named_parameters():
         #     if '_proj' not in name:
         #         parms.requires_grad_(False)
-        
+        self.dino_args = SLConfig.fromfile(model_config_path)
+        time1 = time.time()
+        self.groundingdino = build_groundingdino(self.dino_args)
+        checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+        self.groundingdino.load_state_dict(clean_state_dict(checkpoint['model']), strict = False)
+        print(f'------ build dino use {time.time() - time1}')
+
     def element_score(self, image, caption):
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
@@ -108,6 +145,7 @@ class FGA_Blip2(Blip2Qformer):
             image.device
         )
         attention_mask = torch.cat([query_atts, text.attention_mask], dim=1)
+
         output_itm = self.Qformer.bert(
             text.input_ids,
             query_embeds=query_tokens,
@@ -128,7 +166,7 @@ class FGA_Blip2(Blip2Qformer):
         # breakpoint()
         image = samples["image"]
         caption = samples["text_input"]
-        
+        query_dino = self.groundingdino(image, captions = caption)
         if inference == False:
             mask_gt = torch.tensor(samples["mask"]).to(image.device)
             token_score = torch.tensor(samples["token_score"]).to(image.device)
@@ -139,9 +177,9 @@ class FGA_Blip2(Blip2Qformer):
             with self.maybe_autocast():
                 image_embeds = self.ln_vision(self.visual_encoder(image))
             image_embeds = image_embeds.float()
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
-        )
+        # image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
+        #     image.device
+        # )
         # breakpoint()
         text = self.tokenizer(
             caption,
@@ -157,11 +195,16 @@ class FGA_Blip2(Blip2Qformer):
                 image.device
             )
             attention_mask = torch.cat([query_atts, text.attention_mask], dim=1) # [14, 64] attention_mask标志padding部分
+
+            image_dino_embeds = self.dino_layer(query_dino)
+            image_atts = torch.ones(image_dino_embeds.shape[:-1], dtype=torch.long).to(image.device
+            )
+            # query_tokens =  self.query_fusion_layer(query_dino,query_tokens)
             output_itm = self.Qformer.bert(
                 text.input_ids,
                 query_embeds=query_tokens,
                 attention_mask=attention_mask,
-                encoder_hidden_states=image_embeds,
+                encoder_hidden_states=image_dino_embeds,
                 encoder_attention_mask=image_atts,
                 return_dict=True,
             )

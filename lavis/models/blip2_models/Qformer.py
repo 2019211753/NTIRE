@@ -954,7 +954,7 @@ class BertModel(BertPreTrainedModel):
 
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
-
+        # import pdb;pdb.set_trace()
         return BaseModelOutputWithPoolingAndCrossAttentions(
             last_hidden_state=sequence_output,
             pooler_output=pooled_output,

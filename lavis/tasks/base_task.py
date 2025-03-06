@@ -205,7 +205,6 @@ class BaseTask:
                 break
 
             samples = next(data_loader)
-
             samples = prepare_sample(samples, cuda_enabled=cuda_enabled)
 
             ## notify model that sample is empty (error occured)
