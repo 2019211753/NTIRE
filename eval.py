@@ -94,13 +94,12 @@ def eval(args):
         result_list.append(new_item)
     with open(args.save_path, 'w', newline='', encoding='utf-8') as file:
         json.dump(result_list, file, ensure_ascii=False, indent=4)
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_file', type=str, default='dataset/test.json')
-    parser.add_argument('--save_path', type=str, default='results/result.json')
-    parser.add_argument('--model_path', type=str, default='/data1_8t/user/yb/EvalMuse/lavis/output/FGA-BLIP2/20250215171/checkpoint_3.pth')
-    parser.add_argument('--dataset_dir', type=str, default='dataset/images/')
+    parser.add_argument('--data_file', type=str, default='/data1_8t/user/cmx/Sa2VA-main/NTIRE/dataset/test.json')
+    parser.add_argument('--save_path', type=str, default='/data1_8t/user/cmx/Sa2VA-main/NTIRE/results/result_15mlp3.json')
+    parser.add_argument('--model_path', type=str, default='/data1_8t/user/cmx/Sa2VA-main/NTIRE/lavis/output/FGA-BLIP2/20250312102/checkpoint_14.pth')
+    parser.add_argument('--dataset_dir', type=str, default='/data1_8t/user/cmx/Sa2VA-main/NTIRE/dataset/images/')
     args = parser.parse_args()
     eval(args)
     

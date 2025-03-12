@@ -11,7 +11,18 @@ import torch.nn.functional as F
 from lavis.common.registry import registry
 from lavis.models.blip2_models.blip2_qformer import Blip2Qformer
 from lavis.models.blip_models.blip_outputs import BlipOutput
+try:
+    from mmengine.visualization import Visualizer
+except ImportError:
+    Visualizer = None
+    print("Warning: mmengine is not installed, visualization is disabled.")
+import argparse
+import os
+from torchvision.transforms.functional import to_pil_image
 
+from PIL import Image
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import cv2
 class MLP(nn.Module):
     def __init__(self, input_size):
         super().__init__()
@@ -42,6 +53,16 @@ class MLP(nn.Module):
     def forward(self, input):
         return torch.sigmoid(self.layers(input))
 
+
+def visualize(pred_mask, image_path, work_dir):
+    visualizer = Visualizer()
+    img = cv2.imread(image_path)
+    visualizer.set_image(img)
+    visualizer.draw_binary_masks(pred_mask, colors='g', alphas=0.4)
+    visual_result = visualizer.get_image()
+
+    output_path = os.path.join(work_dir, os.path.basename(image_path))
+    cv2.imwrite(output_path, visual_result)
 @registry.register_model("fga_blip2")
 class FGA_Blip2(Blip2Qformer):
     """
@@ -86,7 +107,19 @@ class FGA_Blip2(Blip2Qformer):
         # for name, parms in self.named_parameters():
         #     if '_proj' not in name:
         #         parms.requires_grad_(False)
-        
+        # self.itm_score_head = nn.Sequential(
+        #     nn.Linear(num_query_token, 16),  # num_query_token 通常是 32
+        #     nn.ReLU(),
+        #     nn.Linear(16, 1)
+        # )186945088   0卡     
+        self.itm_score_head = nn.Sequential(
+            nn.Linear(num_query_token, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1)
+        )
+#186949280   1卡
     def element_score(self, image, caption):
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
@@ -128,12 +161,14 @@ class FGA_Blip2(Blip2Qformer):
         # breakpoint()
         image = samples["image"]
         caption = samples["text_input"]
-        
+        # import pdb
+        # pdb.set_trace()
+
         if inference == False:
             mask_gt = torch.tensor(samples["mask"]).to(image.device)
             token_score = torch.tensor(samples["token_score"]).to(image.device)
             score = torch.tensor(samples["score"]).to(image.device)
-            var = torch.tensor(samples["var"]).to(image.device) # 衡量prompt难度
+            var = torch.tensor(samples["var"]).to(image.device)
             image_embeds = self.ln_vision(self.visual_encoder(image))
         else:
             with self.maybe_autocast():
@@ -152,11 +187,11 @@ class FGA_Blip2(Blip2Qformer):
         ).to(image.device)
 
         if match_head == "itm":
-            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1) # [1, 32, 768] -> [14, 32, 768]
-            query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to( # [14, 32]
+            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+            query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
                 image.device
             )
-            attention_mask = torch.cat([query_atts, text.attention_mask], dim=1) # [14, 64] attention_mask标志padding部分
+            attention_mask = torch.cat([query_atts, text.attention_mask], dim=1)
             output_itm = self.Qformer.bert(
                 text.input_ids,
                 query_embeds=query_tokens,
@@ -165,9 +200,23 @@ class FGA_Blip2(Blip2Qformer):
                 encoder_attention_mask=image_atts,
                 return_dict=True,
             )
-            itm_embeddings = output_itm.last_hidden_state[:, :, :] # [14, 64, 768]
-            itm_logit = self.itm_head(itm_embeddings) # [14, 64, 2]
-            itm_scores = torch.nn.functional.softmax(itm_logit, dim=2)[:,:,1] # [14, 64]
+            itm_embeddings = output_itm.last_hidden_state[:, :, :]
+            itm_logit = self.itm_head(itm_embeddings)
+            itm_scores = torch.nn.functional.softmax(itm_logit, dim=2)[:,:,1]
+            # import pdb;pdb.set_trace()
+            # # 1. 计算 token-level 的匹配分数
+            # itm_logit = self.itm_head(itm_embeddings)                     # [batch_size, seq_len, 2]
+            # itm_scores = torch.nn.functional.softmax(itm_logit, dim=2)[:, :, 1]  # [batch_size, seq_len]
+
+            # # 2. 只取前 query_tokens.size(1) 个 token 对应的分数
+            # query_scores = itm_scores[:, :query_tokens.size(1)]           # [batch_size, query_len]
+
+            # # 3. 使用自定义的 MLP 将 query_scores -> [batch_size, 1]
+            # #    这里要求 MLP 的第一层线性层输入维度 = query_len
+            # final_score = self.itm_score_head(query_scores)               # [batch_size, 1]
+
+            # # 4. 你可以自己决定是否要做一个简单的映射到 [1,5] 区间，或者直接让网络去学习
+            # itm_score = final_score.squeeze(-1) * 4 + 1   # [batch_size]
 
 
             # mask = self.mask_proj(itm_embeddings).squeeze(dim=2)
@@ -182,9 +231,12 @@ class FGA_Blip2(Blip2Qformer):
                 text.input_ids,
                 attention_mask=text.attention_mask,
                 return_dict=True,
-            ) # last_hidden_state [14, 32, 768]
+            )
             mask = self.mask_proj(text_output.last_hidden_state).squeeze(dim=2)
-            itm_score = itm_scores[:, :query_tokens.size(1)].mean(dim=1) * 4 + 1 # item_scores[0:32], project to [0, 5] score
+
+            itm_score = itm_scores[:, :query_tokens.size(1)].mean(dim=1) * 4 + 1
+
+
             # itm_score = (itm_scores * mask).sum(dim=1) / mask.sum(dim=1) * 4 + 1
             # itm_logit = (itm_logit * mask).sum(dim=1) / mask.sum(dim=1)
             # breakpoint()
@@ -202,7 +254,7 @@ class FGA_Blip2(Blip2Qformer):
                 return itm_score
             l1_loss = torch.nn.L1Loss(reduction='mean')
             diff_score = torch.abs(itm_score - score)
-            diff_token_score = torch.abs(itm_scores[:, query_tokens.size(1):] * mask_gt - token_score).mean(dim=1) # token level itm_scores[:32]
+            diff_token_score = torch.abs(itm_scores[:, query_tokens.size(1):] * mask_gt - token_score).mean(dim=1)
             diff_mask = torch.abs(mask - mask_gt).mean(dim=1)
             loss_itm = torch.mean(var * (diff_score + 0.1 * diff_token_score + 0.1 * diff_mask))
             # loss_itm = (itm_scores[:, 1] - score) * (itm_scores[:, 1] - score)
